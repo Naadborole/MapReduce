@@ -9,26 +9,35 @@ package mr
 import (
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/google/uuid"
 )
 
-// example to show how to declare the arguments
-// and reply for an RPC.
 type Empty struct{}
 
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
-// Add your RPC definitions here.
+const (
+	IDLE = iota
+	INPROGRESS
+	FAILED
+)
 
 type WorkerInfo struct {
-	ID uuid.UUID
+	ID    uuid.UUID
+	state int
+	task  Task
+	mu    sync.RWMutex
+}
+
+type Task struct {
+	Name      string
+	InputFile string
+	Num       int
+}
+
+type TaskReport struct {
+	ID       uuid.UUID
+	FileList []string
 }
 
 // Cook up a unique-ish UNIX-domain socket name
