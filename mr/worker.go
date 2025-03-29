@@ -1,11 +1,13 @@
 package mr
 
 import (
-	"bufio"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"net/rpc"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
@@ -13,9 +15,16 @@ import (
 
 var EXIT bool = false
 var ID uuid.UUID
-var fileList []string
-var bucket map[int][]KeyValue
+var fileNameList []string
 var NReduce int
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -31,39 +40,96 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-func writeToIntermediateFiles(kva []KeyValue, NReduce int, taskNum int) {
-	sortIntoBucket(kva, NReduce)
-	for i, kvlist := range bucket {
-		fileName := fmt.Sprintf("mr-%v-%v", taskNum, i)
-		log.Tracef("The filename is : %v", fileName)
-		fileList = append(fileList, fileName)
-		file, err := os.Create(fileName)
-		if err != nil {
-			log.Panic("Creation of file failed")
-		}
-		writer := bufio.NewWriter(file)
-		for _, kv := range kvlist {
-			_, err = writer.WriteString(fmt.Sprintf("%v %v\n", kv.Key, kv.Value))
-			if err != nil {
-				log.Panic("Failed to write to file")
-			}
-		}
-		file.Close()
+func writeJsonToFile(kva []KeyValue, fileName string) {
+	jsonData, err := json.MarshalIndent(kva, "", "    ")
+	if err != nil {
+		panic(err)
+	}
+	err = os.WriteFile(fileName+".json", jsonData, 0644) // 0644 sets file permissions
+	if err != nil {
+		panic(err)
 	}
 }
 
-func sortIntoBucket(kva []KeyValue, NReduce int) {
+func readJsonFromFile(fileName string) []KeyValue {
+	fileData, err := os.ReadFile(fileName + ".json")
+	if err != nil {
+		fmt.Println(err)
+		return []KeyValue{}
+	}
+
+	// Unmarshal JSON data back to struct
+	var kva []KeyValue
+	err = json.Unmarshal(fileData, &kva)
+	if err != nil {
+		fmt.Println(err)
+		return []KeyValue{}
+	}
+	return kva
+}
+
+func writeToIntermediateFiles(kva []KeyValue, NReduce int, taskNum int, bucket map[int][]KeyValue) {
+	sortIntoBucket(kva, NReduce, bucket)
+	for i, kvlist := range bucket {
+		fileName := fmt.Sprintf("mr-%v-%v", taskNum, i)
+		log.Tracef("The filename is : %v", fileName)
+		fileNameList = append(fileNameList, fileName)
+		writeJsonToFile(kvlist, fileName)
+	}
+}
+
+func sortIntoBucket(kva []KeyValue, NReduce int, bucket map[int][]KeyValue) {
 	for _, kv := range kva {
 		bn := ihash(kv.Key) % NReduce
 		bucket[bn] = append(bucket[bn], kv)
 	}
 }
 
+func getKV(line string) KeyValue {
+	t := strings.Split(line, " ")
+	if len(t) == 1 {
+		return KeyValue{t[0], "0"}
+	}
+	return KeyValue{t[0], t[1]}
+}
+
+func addWords(fileName string, wordList map[string][]string) {
+	kva := readJsonFromFile(fileName)
+	for _, kv := range kva {
+		wordList[kv.Key] = append(wordList[kv.Key], kv.Value)
+	}
+}
+func writeOutput(fileName string, out []KeyValue) {
+	sort.Sort(ByKey(out))
+	file, err := os.Create(fileName)
+	if err != nil {
+		log.Panic("Creation of file failed")
+	}
+	for _, kv := range out {
+		fmt.Fprintf(file, "%v %v\n", kv.Key, kv.Value)
+	}
+	file.Close()
+}
+
+func performReduce(reducef func(string, []string) string, taskNum int) {
+	fileList := getFileList()
+	wordList := make(map[string][]string)
+	for _, fileName := range fileList {
+		if strings.HasSuffix(fileName, fmt.Sprintf("-%v", taskNum)) {
+			addWords(fileName, wordList)
+		}
+	}
+	out := []KeyValue{}
+	for k, v := range wordList {
+		out = append(out, KeyValue{k, reducef(k, v)})
+	}
+	writeOutput(fmt.Sprintf("mr-out-%v", taskNum), out)
+}
+
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	log.SetLevel(log.TraceLevel)
-	bucket = make(map[int][]KeyValue)
+	log.SetLevel(log.WarnLevel)
 	ID = getInfo()
 	log.Infof("Worker initialised with ID: %v\n", ID)
 	NReduce = getNReduce()
@@ -76,10 +142,14 @@ func Worker(mapf func(string, string) []KeyValue,
 				log.Fatal(err)
 			}
 			kva := mapf(task.InputFile, string(content))
-			writeToIntermediateFiles(kva, NReduce, task.Num)
-			done()
+			var bucket map[int][]KeyValue = make(map[int][]KeyValue)
+			writeToIntermediateFiles(kva, NReduce, task.Num, bucket)
+			done(fileNameList)
+			fileNameList = []string{}
 		} else if task.Name == "reduce" {
-			log.Infof("Executing reduce task with %v file\n", task.InputFile)
+			log.Infof("Executing reduce task %v", task.Num)
+			performReduce(reducef, task.Num)
+			done([]string{})
 		} else if task.Name == "exit" {
 			EXIT = true
 		} else {
@@ -90,8 +160,18 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
-func done() {
+func getFileList() []string {
+	var fileList []string
+	ok := call("Coordinator.GetIntermediateFileList", &Empty{}, &fileList)
+	if !ok {
+		log.Panicf("call failed!\n")
+	}
+	return fileList
+}
+
+func done(fileList []string) {
 	taskrep := TaskReport{ID, fileList}
+	log.Tracef("Calling Done with file list: %v", fileList)
 	ok := call("Coordinator.FinishMapTask", &taskrep, &Empty{})
 	if !ok {
 		log.Panicf("call failed!\n")

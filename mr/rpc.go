@@ -9,7 +9,6 @@ package mr
 import (
 	"os"
 	"strconv"
-	"sync"
 
 	"github.com/google/uuid"
 )
@@ -26,7 +25,7 @@ type WorkerInfo struct {
 	ID    uuid.UUID
 	state int
 	task  Task
-	mu    sync.RWMutex
+	done  chan bool
 }
 
 type Task struct {
